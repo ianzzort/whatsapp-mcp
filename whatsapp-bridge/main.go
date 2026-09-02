@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -882,6 +883,7 @@ func main() {
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				fmt.Println("QR_RAW:", evt.Code)
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				connected <- true
@@ -918,7 +920,13 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	port := 8590
+	if value := os.Getenv("WHATSAPP_BRIDGE_PORT"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			port = parsed
+		}
+	}
+	startRESTServer(client, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
