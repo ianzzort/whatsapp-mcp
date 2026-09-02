@@ -1,5 +1,8 @@
+import os
+import subprocess
+import tempfile
 from typing import List, Dict, Any, Optional
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Image
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -245,6 +248,111 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+_whisper_model = None
+
+def _whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
+    return _whisper_model
+
+def _transcribe_file(path: str, language: Optional[str] = None):
+    segments, info = _whisper().transcribe(path, language=language)
+    return info.language, " ".join(s.text.strip() for s in segments)
+
+@mcp.tool()
+def transcribe_audio(message_id: str, chat_jid: str, language: Optional[str] = None) -> Dict[str, Any]:
+    """Download a WhatsApp audio/voice message and transcribe it to text. Use this to know what an [audio] message says.
+
+    Args:
+        message_id: The ID of the message containing the audio
+        chat_jid: The JID of the chat containing the message
+        language: Optional ISO language code (e.g. "es"); autodetected if omitted
+    """
+    path = whatsapp_download_media(message_id, chat_jid)
+    if not path:
+        return {"success": False, "message": "Failed to download audio"}
+    lang, text = _transcribe_file(path, language)
+    return {"success": True, "language": lang, "text": text}
+
+@mcp.tool()
+def view_image(message_id: str, chat_jid: str) -> Image:
+    """Download an image from a WhatsApp message and return it so it can be seen and analyzed.
+
+    Args:
+        message_id: The ID of the message containing the image
+        chat_jid: The JID of the chat containing the message
+    """
+    path = whatsapp_download_media(message_id, chat_jid)
+    if not path:
+        raise ValueError("Failed to download image")
+    if os.path.getsize(path) > 900_000:
+        small = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False).name
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-vf", "scale='min(1280,iw)':-2", small],
+            capture_output=True, check=True
+        )
+        path = small
+    return Image(path=path)
+
+@mcp.tool()
+def view_video(message_id: str, chat_jid: str, max_frames: int = 6):
+    """Download a WhatsApp video, extract evenly spaced frames and transcribe its audio track so the video can be understood.
+
+    Args:
+        message_id: The ID of the message containing the video
+        chat_jid: The JID of the chat containing the message
+        max_frames: Maximum number of frames to extract (default 6)
+    """
+    path = whatsapp_download_media(message_id, chat_jid)
+    if not path:
+        return "Failed to download video"
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        capture_output=True, text=True
+    )
+    duration = float(probe.stdout.strip() or 0)
+    fps = max_frames / duration if duration > 0 else 1
+    out_dir = tempfile.mkdtemp()
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", path, "-vf", f"fps={fps},scale='min(800,iw)':-2",
+         "-frames:v", str(max_frames), os.path.join(out_dir, "frame%02d.jpg")],
+        capture_output=True
+    )
+    result = [f"Video duration: {duration:.1f}s"]
+    try:
+        lang, text = _transcribe_file(path)
+        if text.strip():
+            result.append(f"Audio transcript ({lang}): {text}")
+    except Exception:
+        result.append("No audio transcript available")
+    for frame in sorted(os.listdir(out_dir)):
+        result.append(Image(path=os.path.join(out_dir, frame)))
+    return result
+
+@mcp.tool()
+def read_document(message_id: str, chat_jid: str) -> Dict[str, Any]:
+    """Download a WhatsApp document and extract its text. Supports PDF and plain-text files.
+
+    Args:
+        message_id: The ID of the message containing the document
+        chat_jid: The JID of the chat containing the message
+    """
+    path = whatsapp_download_media(message_id, chat_jid)
+    if not path:
+        return {"success": False, "message": "Failed to download document"}
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pdf":
+        from pypdf import PdfReader
+        text = "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+    elif ext in (".txt", ".csv", ".json", ".md", ".xml", ".html", ".log"):
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    else:
+        return {"success": False, "message": f"Unsupported document type: {ext}", "file_path": path}
+    return {"success": True, "text": text[:100_000], "file_path": path}
 
 if __name__ == "__main__":
     # Initialize and run the server
