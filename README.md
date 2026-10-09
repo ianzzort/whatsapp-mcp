@@ -183,3 +183,19 @@ By default, just the metadata of the media is stored in the local database. The 
 For additional Claude Desktop integration troubleshooting, see the [MCP documentation](https://modelcontextprotocol.io/quickstart/server#claude-for-desktop-integration-issues). The documentation includes helpful tips for checking logs and resolving common issues.
 #   w h a t s a p p - m c p  
  
+## Bridge hardening (REST API)
+
+Environment variables:
+
+- `WHATSAPP_BRIDGE_BIND` (default `127.0.0.1`) and `WHATSAPP_BRIDGE_PORT` (default `8590`).
+- `WHATSAPP_BRIDGE_TOKEN`: when set, every `/api/*` request needs `Authorization: Bearer <token>`, otherwise 401. A warning is logged when unset.
+- `WHATSAPP_ALERT_WEBHOOK`: URL receiving `POST {event, at, message}` on logout or after more than 5 minutes disconnected.
+
+Endpoints:
+
+- `POST /api/send` (rate limited: 1 message per recipient every 3s, 20 per minute overall, otherwise 429) and `POST /api/download`.
+- `GET /api/health` returns `{connected, logged_in, uptime_seconds, last_message_at}`.
+- `GET /api/groups` lists joined groups (`jid`, `name`).
+- `GET /api/groups/{jid}/participants` returns `{jid, name, participants:[{jid, lid, phone, is_admin}]}`.
+
+Messages now also store `reply_to_id`, `mentions` (JSON array of JIDs) and `push_name`; `messages.db` runs in WAL mode. See `deploy/README.md` to run it as a systemd service.

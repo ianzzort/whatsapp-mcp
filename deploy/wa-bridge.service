@@ -1,0 +1,21 @@
+[Unit]
+Description=WhatsApp bridge (whatsmeow)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wabridge
+Group=wabridge
+WorkingDirectory=/opt/wa-bridge
+EnvironmentFile=/etc/wa-bridge.env
+ExecStart=/opt/wa-bridge/whatsapp-client
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

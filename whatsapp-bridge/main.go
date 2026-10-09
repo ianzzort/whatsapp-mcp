@@ -55,7 +55,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -91,7 +91,16 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	store := &MessageStore{db: db}
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to set pragmas: %v", err)
+	}
+	if err := store.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+	}
+	return store, nil
 }
 
 // Close the database connection
@@ -110,7 +119,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, mc MsgContext) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -118,9 +127,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, reply_to_id, mentions, push_name) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, mc.ReplyToID, mc.Mentions, mc.PushName,
 	)
 	return err
 }
@@ -460,7 +469,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		buildMsgContext(msg.Message, msg.Info.PushName),
 	)
+	bridgeState.touchMessage(msg.Info.Timestamp)
 
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
@@ -691,7 +702,9 @@ func extractDirectPathFromURL(url string) string {
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	limiter := NewSendLimiter(3*time.Second, 20)
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -716,6 +729,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		if !limiter.Allow(req.Recipient, time.Now()) {
+			w.Header().Set("Retry-After", "3")
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
@@ -737,7 +756,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -788,12 +807,21 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	registerExtraRoutes(mux, client)
+	token := os.Getenv("WHATSAPP_BRIDGE_TOKEN")
+	if token == "" {
+		fmt.Println("WARNING: WHATSAPP_BRIDGE_TOKEN is not set, /api/* endpoints are unauthenticated")
+	}
+	bind := os.Getenv("WHATSAPP_BRIDGE_BIND")
+	if bind == "" {
+		bind = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bind, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.ListenAndServe(serverAddr, authMiddleware(token, mux)); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -860,9 +888,14 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			handleConnected()
+
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp")
+			handleDisconnected(client, logger)
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			handleLoggedOut(logger)
 		}
 	})
 
@@ -1139,6 +1172,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					buildMsgContext(msg.Message.Message, msg.Message.GetPushName()),
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
