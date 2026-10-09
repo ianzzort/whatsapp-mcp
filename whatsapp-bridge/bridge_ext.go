@@ -243,7 +243,7 @@ type groupParticipantOut struct {
 	IsAdmin bool   `json:"is_admin"`
 }
 
-func registerExtraRoutes(mux *http.ServeMux, client *whatsmeow.Client) {
+func registerExtraRoutes(mux *http.ServeMux, client *whatsmeow.Client, store *MessageStore) {
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		bridgeState.mu.Lock()
 		last := bridgeState.lastMessageAt
@@ -280,6 +280,32 @@ func registerExtraRoutes(mux *http.ServeMux, client *whatsmeow.Client) {
 
 	mux.HandleFunc("/api/groups/", func(w http.ResponseWriter, r *http.Request) {
 		rest := strings.TrimPrefix(r.URL.Path, "/api/groups/")
+		if r.Method == http.MethodPut && strings.HasSuffix(rest, "/name") {
+			raw := strings.TrimSuffix(rest, "/name")
+			jid, err := types.ParseJID(raw)
+			if err != nil || jid.Server != types.GroupServer {
+				http.Error(w, "Invalid group JID", http.StatusBadRequest)
+				return
+			}
+			var body struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+				http.Error(w, "Missing name", http.StatusBadRequest)
+				return
+			}
+			name := strings.TrimSpace(body.Name)
+			if err := client.SetGroupName(context.Background(), jid, name); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			if _, err := store.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid.String()); err != nil {
+				writeJSON(w, http.StatusOK, map[string]interface{}{"jid": jid.String(), "name": name, "warning": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"jid": jid.String(), "name": name})
+			return
+		}
 		if r.Method != http.MethodGet || !strings.HasSuffix(rest, "/participants") {
 			http.NotFound(w, r)
 			return

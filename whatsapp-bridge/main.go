@@ -807,7 +807,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	registerExtraRoutes(mux, client)
+	registerExtraRoutes(mux, client, messageStore)
 	token := os.Getenv("WHATSAPP_BRIDGE_TOKEN")
 	if token == "" {
 		fmt.Println("WARNING: WHATSAPP_BRIDGE_TOKEN is not set, /api/* endpoints are unauthenticated")
