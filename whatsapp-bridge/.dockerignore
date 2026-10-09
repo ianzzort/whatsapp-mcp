@@ -1,0 +1,4 @@
+whatsapp-client
+store/
+*.log*
+*_test.go
