@@ -700,11 +700,12 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(sess *SessionManager, messageStore *MessageStore, port int) {
 	// Handler for sending messages
 	mux := http.NewServeMux()
 	limiter := NewSendLimiter(3*time.Second, 20)
 	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+		client := sess.Client()
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -757,6 +758,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 	// Handler for downloading media
 	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+		client := sess.Client()
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -807,7 +809,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	registerExtraRoutes(mux, client, messageStore)
+	registerExtraRoutes(mux, sess, messageStore)
 	token := os.Getenv("WHATSAPP_BRIDGE_TOKEN")
 	if token == "" {
 		fmt.Println("WARNING: WHATSAPP_BRIDGE_TOKEN is not set, /api/* endpoints are unauthenticated")
@@ -860,14 +862,6 @@ func main() {
 		}
 	}
 
-	// Create client instance
-	client := whatsmeow.NewClient(deviceStore, logger)
-	if client == nil {
-		logger.Errorf("Failed to create WhatsApp client")
-		return
-	}
-
-	// Initialize message store
 	messageStore, err := NewMessageStore()
 	if err != nil {
 		logger.Errorf("Failed to initialize message store: %v", err)
@@ -875,29 +869,12 @@ func main() {
 	}
 	defer messageStore.Close()
 
-	// Setup event handling for messages and history sync
-	client.AddEventHandler(func(evt interface{}) {
-		switch v := evt.(type) {
-		case *events.Message:
-			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
-
-		case *events.HistorySync:
-			// Process history sync events
-			handleHistorySync(client, messageStore, v, logger)
-
-		case *events.Connected:
-			logger.Infof("Connected to WhatsApp")
-			handleConnected()
-
-		case *events.Disconnected:
-			logger.Warnf("Disconnected from WhatsApp")
-			handleDisconnected(client, logger)
-
-		case *events.LoggedOut:
-			handleLoggedOut(logger)
-		}
-	})
+	sess := NewSessionManager(container, messageStore, logger)
+	client := sess.Install(deviceStore)
+	if client == nil {
+		logger.Errorf("Failed to create WhatsApp client")
+		return
+	}
 
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
@@ -959,7 +936,7 @@ func main() {
 			port = parsed
 		}
 	}
-	startRESTServer(client, messageStore, port)
+	startRESTServer(sess, messageStore, port)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
@@ -971,8 +948,7 @@ func main() {
 	<-exitChan
 
 	fmt.Println("Disconnecting...")
-	// Disconnect client
-	client.Disconnect()
+	sess.Client().Disconnect()
 }
 
 // GetChatName determines the appropriate name for a chat based on JID and other info

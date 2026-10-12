@@ -243,8 +243,10 @@ type groupParticipantOut struct {
 	IsAdmin bool   `json:"is_admin"`
 }
 
-func registerExtraRoutes(mux *http.ServeMux, client *whatsmeow.Client, store *MessageStore) {
+func registerExtraRoutes(mux *http.ServeMux, sess *SessionManager, store *MessageStore) {
+	sess.registerRoutes(mux)
 	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		client := sess.Client()
 		bridgeState.mu.Lock()
 		last := bridgeState.lastMessageAt
 		started := bridgeState.startedAt
@@ -262,6 +264,7 @@ func registerExtraRoutes(mux *http.ServeMux, client *whatsmeow.Client, store *Me
 	})
 
 	mux.HandleFunc("/api/groups", func(w http.ResponseWriter, r *http.Request) {
+		client := sess.Client()
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -279,6 +282,7 @@ func registerExtraRoutes(mux *http.ServeMux, client *whatsmeow.Client, store *Me
 	})
 
 	mux.HandleFunc("/api/groups/", func(w http.ResponseWriter, r *http.Request) {
+		client := sess.Client()
 		rest := strings.TrimPrefix(r.URL.Path, "/api/groups/")
 		if r.Method == http.MethodPut && strings.HasSuffix(rest, "/name") {
 			raw := strings.TrimSuffix(rest, "/name")
